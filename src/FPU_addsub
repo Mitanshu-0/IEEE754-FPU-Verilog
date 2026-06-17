@@ -1,0 +1,231 @@
+module FPU_addsub (
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    input  wire        op,
+    input  wire        enable,
+    output reg  [31:0] result,
+    output reg         overflow,
+    output reg         underflow,
+    output reg         invalid,
+    output reg         inexact
+);
+
+wire        sign_a = a[31];
+wire        sign_b = b[31];
+wire [7:0]  exp_a  = a[30:23];
+wire [7:0]  exp_b  = b[30:23];
+wire [22:0] mant_a = a[22:0];
+wire [22:0] mant_b = b[22:0];
+
+wire is_nan_a    = (exp_a == 8'hFF) && (mant_a != 23'h0);
+wire is_nan_b    = (exp_b == 8'hFF) && (mant_b != 23'h0);
+wire is_inf_a    = (exp_a == 8'hFF) && (mant_a == 23'h0);
+wire is_inf_b    = (exp_b == 8'hFF) && (mant_b == 23'h0);
+wire is_zero_a   = (exp_a == 8'h00) && (mant_a == 23'h0);
+wire is_zero_b   = (exp_b == 8'h00) && (mant_b == 23'h0);
+wire is_denorm_a = (exp_a == 8'h00) && (mant_a != 23'h0);
+wire is_denorm_b = (exp_b == 8'h00) && (mant_b != 23'h0);
+
+wire eff_sign_b  = op ? ~sign_b : sign_b;
+
+wire both_inf      = is_inf_a && is_inf_b;
+wire inf_same_sign = both_inf && (sign_a == eff_sign_b);
+wire inf_diff_sign = both_inf && (sign_a != eff_sign_b);
+
+reg        S1, S2;
+reg [7:0]  E1, E2;
+reg [24:0] M1, M2;
+reg [24:0] M2_shifted;
+reg [24:0] op_ment;
+reg        final_sign;
+
+reg        G;
+reg        R;
+reg        S_bit;
+
+reg        round_up;
+reg        done;
+
+reg  [7:0] shift;
+integer    shift_int;
+integer    i;
+
+always @(*) begin
+
+    result    = 32'b0;
+    overflow  = 1'b0;
+    underflow = 1'b0;
+    invalid   = 1'b0;
+    inexact   = 1'b0;
+
+    if (!enable) begin
+        result    = 32'b0;
+        overflow  = 1'b0;
+        underflow = 1'b0;
+        invalid   = 1'b0;
+        inexact   = 1'b0;
+    end
+
+    else if (is_nan_a || is_nan_b) begin
+        result  = 32'h7FC0_0000;
+        invalid = 1'b1;
+    end
+
+    else if (inf_diff_sign) begin
+        result  = 32'h7FC0_0000;
+        invalid = 1'b1;
+    end
+
+    else if (inf_same_sign) begin
+        result = {sign_a, 8'hFF, 23'h0};
+    end
+
+    else if (is_inf_a) begin
+        result = {sign_a, 8'hFF, 23'h0};
+    end
+
+    else if (is_inf_b) begin
+        result = {eff_sign_b, 8'hFF, 23'h0};
+    end
+
+    else if ((is_zero_a || is_denorm_a) && (is_zero_b || is_denorm_b)) begin
+        result = (!op && sign_a && sign_b) ? 32'h8000_0000
+                                           : 32'h0000_0000;
+    end
+
+    else if (is_zero_a || is_denorm_a) begin
+        result = {eff_sign_b, exp_b, mant_b};
+    end
+
+    else if (is_zero_b || is_denorm_b) begin
+        result = a;
+    end
+
+    else begin
+
+        G     = 1'b0;
+        R     = 1'b0;
+        S_bit = 1'b0;
+
+        if (exp_a >= exp_b) begin
+            E1 = (exp_a == 8'h00) ? 8'd1 : exp_a;
+            E2 = (exp_b == 8'h00) ? 8'd1 : exp_b;
+            M1 = (exp_a == 8'h00) ? {2'b00, mant_a} : {1'b0, 1'b1, mant_a};
+            M2 = (exp_b == 8'h00) ? {2'b00, mant_b} : {1'b0, 1'b1, mant_b};
+            S1 = sign_a;
+            S2 = sign_b;
+        end
+        else begin
+            E1 = (exp_b == 8'h00) ? 8'd1 : exp_b;
+            E2 = (exp_a == 8'h00) ? 8'd1 : exp_a;
+            M1 = (exp_b == 8'h00) ? {2'b00, mant_b} : {1'b0, 1'b1, mant_b};
+            M2 = (exp_a == 8'h00) ? {2'b00, mant_a} : {1'b0, 1'b1, mant_a};
+            S1 = sign_b;
+            S2 = sign_a;
+        end
+
+        shift     = E1 - E2;
+        shift_int = shift;
+
+        M2_shifted = M2 >> shift;
+
+        if (shift_int >= 25) begin
+            S_bit = |M2;
+        end
+        else if (shift_int > 0) begin
+            for (i = 0; i < 24; i = i + 1) begin
+                if (i == shift_int - 1)
+                    G     = M2[i];
+                else if (i == shift_int - 2)
+                    R     = M2[i];
+                else if (i <  shift_int - 2)
+                    S_bit = S_bit | M2[i];
+            end
+        end
+
+        if ((op == 1'b0 && S1 == S2) ||
+            (op == 1'b1 && S1 != S2)) begin
+            op_ment    = M1 + M2_shifted;
+            final_sign = S1;
+        end
+        else begin
+            if (M1 >= M2_shifted) begin
+                op_ment    = M1 - M2_shifted;
+                final_sign = S1;
+            end
+            else begin
+                op_ment    = M2_shifted - M1;
+                final_sign = ~S1;
+            end
+        end
+
+        if (op_ment == 25'b0) begin
+            result    = 32'b0;
+            overflow  = 1'b0;
+            underflow = 1'b0;
+        end
+
+        else begin
+
+            if (op_ment[24]) begin
+                S_bit   = S_bit | R;
+                R       = G;
+                G       = op_ment[0];
+                op_ment = op_ment >> 1;
+                E1      = E1 + 8'h1;
+            end
+
+            done = 1'b0;
+            for (i = 0; i < 24; i = i + 1) begin
+                if (!done) begin
+                    if (op_ment[23] == 1'b0 && E1 > 8'd1) begin
+                        G       = R;
+                        R       = S_bit;
+                        S_bit   = 1'b0;
+                        op_ment = op_ment << 1;
+                        E1      = E1 - 8'h1;
+                    end
+                    else begin
+                        done = 1'b1;
+                    end
+                end
+            end
+
+            if (E1 == 8'd1 && op_ment[23] == 1'b0)
+                E1 = 8'd0;
+
+            if (G | R | S_bit)
+                inexact = 1'b1;
+
+            round_up = G & (R | S_bit | op_ment[0]);
+
+            if (round_up) begin
+                op_ment = op_ment + 25'd1;
+
+                if (op_ment[24]) begin
+                    G       = op_ment[0];
+                    op_ment = op_ment >> 1;
+                    E1      = E1 + 8'h1;
+                end
+            end
+
+            if (E1 >= 8'hFF) begin
+                result   = {final_sign, 8'hFF, 23'b0};
+                overflow = 1'b1;
+            end
+            else if (E1 == 8'h00) begin
+                result    = {final_sign, 8'h00, op_ment[22:0]};
+                underflow = 1'b1;
+            end
+            else begin
+                result = {final_sign, E1[7:0], op_ment[22:0]};
+            end
+
+        end
+
+    end
+
+end
+
+endmodule
+
