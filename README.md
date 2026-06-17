@@ -463,13 +463,10 @@ Potential enhancements include:
 
 ### Mitanshu Dhameliya
 
-Electronics and Communication Engineering
-
-Nirma University
 
 ---
 
 ## License
 
 This project is intended for educational, academic, and learning purposes.
-For commercial use, please contact the author.
+
