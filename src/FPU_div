@@ -1,0 +1,157 @@
+module FPU_div (
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    input  wire        enable,
+    output reg  [31:0] result,
+    output reg         overflow,
+    output reg         underflow,
+    output reg         div_by_zero,
+    output reg         invalid,
+    output reg         inexact
+);
+
+wire        sign_a = a[31];
+wire        sign_b = b[31];
+wire [7:0]  exp_a  = a[30:23];
+wire [7:0]  exp_b  = b[30:23];
+wire [22:0] mant_a = a[22:0];
+wire [22:0] mant_b = b[22:0];
+
+wire is_zero_a   = (exp_a == 8'h00) && (mant_a == 23'h0);
+wire is_zero_b   = (exp_b == 8'h00) && (mant_b == 23'h0);
+wire is_denorm_a = (exp_a == 8'h00) && (mant_a != 23'h0);
+wire is_denorm_b = (exp_b == 8'h00) && (mant_b != 23'h0);
+wire is_inf_a    = (exp_a == 8'hFF) && (mant_a == 23'h0);
+wire is_inf_b    = (exp_b == 8'hFF) && (mant_b == 23'h0);
+wire is_nan_a    = (exp_a == 8'hFF) && (mant_a != 23'h0);
+wire is_nan_b    = (exp_b == 8'hFF) && (mant_b != 23'h0);
+
+wire is_zd_a = is_zero_a | is_denorm_a;
+wire is_zd_b = is_zero_b | is_denorm_b;
+
+wire sign_c = sign_a ^ sign_b;
+
+wire [23:0] sig_a   = {1'b1, mant_a};
+wire [23:0] sig_b_w = {1'b1, mant_b};
+
+wire signed [10:0] exp_diff =
+    {3'b000, exp_a} - {3'b000, exp_b} + 11'sd127;
+
+reg [24:0] A;
+reg [25:0] Q;
+integer    b_idx;
+
+always @(*) begin
+    Q = 26'b0;
+
+    if (sig_a >= sig_b_w) begin
+        Q[25] = 1'b1;
+        A     = {1'b0, sig_a} - {1'b0, sig_b_w};
+    end
+    else begin
+        Q[25] = 1'b0;
+        A     = {1'b0, sig_a};
+    end
+
+    for (b_idx = 24; b_idx >= 0; b_idx = b_idx - 1) begin
+        A = A << 1;
+
+        if (A >= {1'b0, sig_b_w}) begin
+            Q[b_idx] = 1'b1;
+            A        = A - {1'b0, sig_b_w};
+        end
+        else begin
+            Q[b_idx] = 1'b0;
+        end
+    end
+end
+
+wire        norm_bit   = Q[25];
+wire [22:0] mant_norm  = norm_bit ? Q[24:2]  : Q[23:1];
+wire        guard_bit  = norm_bit ? Q[1]      : Q[0];
+wire        round_bit  = norm_bit ? Q[0]      : 1'b0;
+wire        sticky_bit = (A != 25'b0);
+
+wire signed [10:0] exp_norm =
+    norm_bit ? exp_diff : (exp_diff - 11'sd1);
+
+wire inexact_w = guard_bit | round_bit | sticky_bit;
+
+wire round_up =
+    guard_bit & (sticky_bit | round_bit | mant_norm[0]);
+
+wire [23:0] mant_rounded =
+    {1'b0, mant_norm} + {23'h0, round_up};
+
+wire signed [10:0] exp_final =
+    mant_rounded[23] ? (exp_norm + 11'sd1) : exp_norm;
+
+wire [22:0] mant_final =
+    mant_rounded[23] ? mant_rounded[23:1] : mant_rounded[22:0];
+
+wire ovf = (exp_final >= 11'sd255);
+wire unf = (exp_final <= 11'sd0);
+
+wire [31:0] normal_result = {sign_c, exp_final[7:0], mant_final};
+
+always @(*) begin
+    result      = 32'b0;
+    overflow    = 1'b0;
+    underflow   = 1'b0;
+    div_by_zero = 1'b0;
+    invalid     = 1'b0;
+    inexact     = 1'b0;
+
+    if (!enable) begin
+        result      = 32'b0;
+        overflow    = 1'b0;
+        underflow   = 1'b0;
+        div_by_zero = 1'b0;
+        invalid     = 1'b0;
+        inexact     = 1'b0;
+    end
+
+    else if (is_nan_a || is_nan_b ||
+             (is_inf_a && is_inf_b) ||
+             (is_zd_a  && is_zd_b)) begin
+        result  = 32'h7FC0_0000;
+        invalid = 1'b1;
+    end
+
+    else if (is_inf_a && !is_inf_b) begin
+        result = {sign_c, 8'hFF, 23'h0};
+    end
+
+    else if (is_inf_b && !is_inf_a) begin
+        result = {sign_c, 31'h0};
+    end
+
+    else if (is_zd_a && !is_zd_b) begin
+        result = {sign_c, 31'h0};
+    end
+
+    else if (is_zd_b && !is_zd_a) begin
+        result      = {sign_c, 8'hFF, 23'h0};
+        div_by_zero = 1'b1;
+    end
+
+    else if (ovf) begin
+        result   = {sign_c, 8'hFF, 23'h0};
+        overflow = 1'b1;
+        inexact  = 1'b1;
+    end
+
+    else if (unf) begin
+        result    = {sign_c, 31'h0};
+        underflow = 1'b1;
+        inexact   = 1'b1;
+    end
+
+    else begin
+        result  = normal_result;
+        inexact = inexact_w;
+    end
+end
+
+endmodule
+
